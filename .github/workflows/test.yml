@@ -1,0 +1,36 @@
+name: Test Automation Scripts
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax check
+        run: |
+          set -Eeuo pipefail
+          python3 -m py_compile scripts/*.py
+
+      - name: FDB release note fixture selects non-AVX version
+        run: |
+          set -Eeuo pipefail
+          selected="$(python3 scripts/select-fdb-version.py --release-notes-file tests/fixtures/fdb-release-notes-730-mini.html --print-version)"
+          test "${selected}" = "7.3.78"
+
+      - name: FDB release note fixture rejects AVX override
+        run: |
+          set -Eeuo pipefail
+          if python3 scripts/select-fdb-version.py --release-notes-file tests/fixtures/fdb-release-notes-730-mini.html --requested-version 7.3.79 --print-version; then
+            echo "Expected AVX override to fail" >&2
+            exit 1
+          fi
