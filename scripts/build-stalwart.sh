@@ -15,11 +15,24 @@ features="foundationdb s3 zenoh enterprise"
     --features "${features}"
 ) &
 build_pid=$!
+started_at=$(date +%s)
 
 while kill -0 "${build_pid}" 2>/dev/null; do
   sleep 60
   if kill -0 "${build_pid}" 2>/dev/null; then
-    printf 'Stalwart source build is still running at %s\n' "$(date -u +%FT%TZ)"
+    now=$(date +%s)
+    printf '\n=== Stalwart build heartbeat: %s, elapsed %dm %02ds ===\n' \
+      "$(date -u +%FT%TZ)" \
+      "$(((now - started_at) / 60))" \
+      "$(((now - started_at) % 60))"
+    printf '%s\n' 'Top compiler/linker processes:'
+    ps -eo pid,ppid,etimes,pcpu,pmem,rss,stat,comm,args --sort=-pcpu |
+      sed -n '1,12p'
+    printf '%s\n' 'Runner memory:'
+    free -h
+    printf 'Cargo target size: '
+    du -sh "${source_dir}/target" 2>/dev/null || echo 'not created yet'
+    printf '%s\n\n' '=== End build heartbeat ==='
   fi
 done
 
