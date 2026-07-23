@@ -1,0 +1,174 @@
+name: Build Stalwart FDB Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      stalwart_version:
+        description: "Exact upstream Stalwart tag, for example v0.16.14. Empty selects newest stable tag."
+        required: false
+        type: string
+      fdb_version:
+        description: "Exact FoundationDB 7.3.x version. Empty selects newest non-AVX 7.3 release from release notes."
+        required: false
+        type: string
+  schedule:
+    - cron: "0 */6 * * *"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout automation
+        uses: actions/checkout@v4
+
+      - name: Select versions
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          INPUT_STALWART_VERSION: ${{ inputs.stalwart_version }}
+          INPUT_FDB_VERSION: ${{ inputs.fdb_version }}
+        run: |
+          set -Eeuo pipefail
+
+          latest_stalwart="$(python3 scripts/list-stalwart-tags.py --print-latest)"
+          if [ -n "${INPUT_STALWART_VERSION}" ]; then
+            stalwart_version="${INPUT_STALWART_VERSION}"
+          else
+            stalwart_version="${latest_stalwart}"
+          fi
+
+          if [ -n "${INPUT_FDB_VERSION}" ]; then
+            fdb_version="$(python3 scripts/select-fdb-version.py --requested-version "${INPUT_FDB_VERSION}" --print-version)"
+          else
+            fdb_version="$(python3 scripts/select-fdb-version.py --print-version)"
+          fi
+
+          stalwart_major_minor="$(python3 scripts/list-stalwart-tags.py --print-major-minor "${stalwart_version}")"
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/stalwart-fdb"
+          version_tag="${stalwart_version}-fdb${fdb_version}"
+
+          publish_latest=false
+          if [ "${stalwart_version}" = "${latest_stalwart}" ]; then
+            publish_latest=true
+          fi
+
+          {
+            echo "LATEST_STALWART_VERSION=${latest_stalwart}"
+            echo "STALWART_VERSION=${stalwart_version}"
+            echo "STALWART_MAJOR_MINOR=${stalwart_major_minor}"
+            echo "FDB_VERSION=${fdb_version}"
+            echo "IMAGE=${image}"
+            echo "VERSION_TAG=${version_tag}"
+            echo "PUBLISH_LATEST=${publish_latest}"
+          } >> "${GITHUB_ENV}"
+
+          echo "Selected Stalwart ${stalwart_version}"
+          echo "Selected FoundationDB ${fdb_version}"
+          echo "Image ${image}:${version_tag}"
+          echo "Publish latest tags: ${publish_latest}"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check whether image tag already exists
+        id: exists
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if docker manifest inspect "${IMAGE}:${VERSION_TAG}" >/dev/null 2>&1; then
+            echo "exists=true" >> "${GITHUB_OUTPUT}"
+            echo "${IMAGE}:${VERSION_TAG} already exists; skipping build."
+          else
+            echo "exists=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Checkout upstream Stalwart source
+        if: steps.exists.outputs.exists != 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git clone --depth 1 --branch "${STALWART_VERSION}" https://github.com/stalwartlabs/stalwart.git upstream
+
+      - name: Pin upstream Dockerfile.fdb to selected FoundationDB version
+        if: steps.exists.outputs.exists != 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/pin-dockerfile-fdb-version.py upstream/Dockerfile.fdb "${FDB_VERSION}"
+          grep -n 'FDB_VERSION\|tag_name == \$VERSION' upstream/Dockerfile.fdb
+
+      - name: Set up Docker Buildx
+        if: steps.exists.outputs.exists != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build local smoke-test image
+        if: steps.exists.outputs.exists != 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          docker buildx build \
+            --platform linux/amd64 \
+            --load \
+            --file upstream/Dockerfile.fdb \
+            --tag "${IMAGE}:${VERSION_TAG}" \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.vendor=MK796" \
+            --label "org.opencontainers.image.title=stalwart-fdb" \
+            --label "org.opencontainers.image.version=${VERSION_TAG}" \
+            --label "org.opencontainers.image.base.name=stalwartlabs/stalwart" \
+            --label "org.mk796.foundationdb.version=${FDB_VERSION}" \
+            --label "org.mk796.foundationdb.avx=disabled" \
+            upstream
+
+      - name: Smoke test image
+        if: steps.exists.outputs.exists != 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          docker run --rm --entrypoint sh "${IMAGE}:${VERSION_TAG}" -c '
+            /usr/local/bin/stalwart --version
+            find /usr/lib /usr/local/lib -name "libfdb_c.so*" 2>/dev/null | grep .
+          '
+
+      - name: Push tags
+        if: steps.exists.outputs.exists != 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          tags=(
+            "${VERSION_TAG}"
+            "${STALWART_MAJOR_MINOR}-fdb${FDB_VERSION}"
+          )
+
+          if [ "${PUBLISH_LATEST}" = "true" ]; then
+            tags+=("latest-fdb${FDB_VERSION}" "latest")
+          fi
+
+          for tag in "${tags[@]}"; do
+            docker tag "${IMAGE}:${VERSION_TAG}" "${IMAGE}:${tag}"
+            docker push "${IMAGE}:${tag}"
+          done
+
+      - name: Summary
+        shell: bash
+        run: |
+          {
+            echo "## stalwart-fdb build"
+            echo
+            echo "- Stalwart: ${STALWART_VERSION}"
+            echo "- FoundationDB: ${FDB_VERSION}"
+            echo "- Image: ${IMAGE}:${VERSION_TAG}"
+            echo "- Existing tag skipped: ${{ steps.exists.outputs.exists }}"
+            echo "- Latest tags updated: ${PUBLISH_LATEST}"
+          } >> "${GITHUB_STEP_SUMMARY}"
