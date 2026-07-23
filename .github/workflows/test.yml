@@ -21,33 +21,47 @@ jobs:
           set -Eeuo pipefail
           python3 -m py_compile scripts/*.py
 
-      - name: FDB release note fixture selects non-AVX version
+      - name: Select newest stable Stalwart release with FDB asset
         run: |
           set -Eeuo pipefail
-          selected="$(python3 scripts/select-fdb-version.py --release-notes-file tests/fixtures/fdb-release-notes-730-mini.html --print-version)"
-          test "${selected}" = "7.3.78"
+          selected="$(
+            python3 scripts/list-stalwart-tags.py \
+              --releases-file tests/fixtures/stalwart-releases-mini.json \
+              --print-latest
+          )"
+          test "${selected}" = "v0.16.14"
+          python3 scripts/list-stalwart-tags.py \
+            --releases-file tests/fixtures/stalwart-releases-mini.json \
+            --validate v0.16.14
 
-      - name: FDB release note fixture rejects AVX override
+      - name: Detect Stalwart FDB API series
         run: |
           set -Eeuo pipefail
-          if python3 scripts/select-fdb-version.py --release-notes-file tests/fixtures/fdb-release-notes-730-mini.html --requested-version 7.3.79 --print-version; then
+          series="$(
+            python3 scripts/detect-fdb-series.py \
+              --manifest-file tests/fixtures/stalwart-store-Cargo.toml
+          )"
+          test "${series}" = "7.4"
+
+      - name: Select newest explicitly non-AVX FDB release
+        run: |
+          set -Eeuo pipefail
+          selected="$(
+            python3 scripts/select-fdb-version.py \
+              --series 7.4 \
+              --releases-file tests/fixtures/fdb-releases-740-mini.json \
+              --print-version
+          )"
+          test "${selected}" = "7.4.4"
+
+      - name: Reject AVX FDB override
+        run: |
+          set -Eeuo pipefail
+          if python3 scripts/select-fdb-version.py \
+            --series 7.4 \
+            --releases-file tests/fixtures/fdb-releases-740-mini.json \
+            --requested-version 7.4.6 \
+            --print-version; then
             echo "Expected AVX override to fail" >&2
-            exit 1
-          fi
-
-      - name: Dockerfile patch aligns Cargo build arguments
-        run: |
-          set -Eeuo pipefail
-          patched_dockerfile="$(mktemp)"
-          trap 'rm -f "${patched_dockerfile}"' EXIT
-          cp tests/fixtures/Dockerfile.fdb-upstream-mini "${patched_dockerfile}"
-
-          python3 scripts/pin-dockerfile-fdb-version.py "${patched_dockerfile}" 7.3.78
-
-          grep -Fqx 'ARG FDB_VERSION="7.3.78"' "${patched_dockerfile}"
-          grep -Fq 'select(.tag_name == $VERSION)' "${patched_dockerfile}"
-          grep -Fqx 'RUN cargo chef cook --release --recipe-path recipe.json -p stalwart --no-default-features --features "foundationdb s3 redis azure nats enterprise"' "${patched_dockerfile}"
-          if grep -Fq 'FDB_VERSION_RANGE' "${patched_dockerfile}"; then
-            echo "FDB_VERSION_RANGE still exists after patch" >&2
             exit 1
           fi

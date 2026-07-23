@@ -1,8 +1,14 @@
 # stalwart-fdb
 
-Build upstream Stalwart Docker images with FoundationDB client support.
+Packages the official FoundationDB-enabled Stalwart release binary as a small Docker image.
 
-This repository does not vendor or fork Stalwart source code. The GitHub Actions workflow checks upstream `stalwartlabs/stalwart` tags, checks FoundationDB 7.3 release notes for the newest non-AVX client release, builds upstream Stalwart with upstream `Dockerfile.fdb`, and publishes the resulting image to GHCR.
+This repository does **not** compile, patch, or fork Stalwart. Every six hours, GitHub Actions:
+
+1. finds the newest stable Stalwart release containing the Linux x86_64 FoundationDB binary;
+2. verifies that binary with Stalwart's GitHub build attestation;
+3. reads the release tag's Cargo manifest to determine the required FDB API series;
+4. selects the newest release in that series whose official FoundationDB release notes explicitly say it is non-AVX;
+5. verifies `libfdb_c.so` against Apple's published SHA-256 checksum and packages both files using Stalwart's upstream runtime layout.
 
 ## Image
 
@@ -10,26 +16,28 @@ This repository does not vendor or fork Stalwart source code. The GitHub Actions
 ghcr.io/mk796/stalwart-fdb
 ```
 
-Example tags:
+Example tags for Stalwart `v0.16.14`, which requires FDB API `7.4`:
 
 ```text
-v0.16.14-fdb7.3.78
-v0.16-fdb7.3.78
-latest-fdb7.3.78
+v0.16.14-fdb7.4.4
+v0.16-fdb7.4.4
+latest-fdb7.4.4
 latest
 ```
 
-`latest` means the newest stable upstream Stalwart tag built with the newest automatically selected non-AVX FoundationDB 7.3 client release.
+The immutable full tag is always published. Moving `vMAJOR.MINOR`, `latest-fdbVERSION`, and `latest` aliases are updated only for the newest automatically selected combination.
 
-## AVX Safety
+The image currently targets `linux/amd64`.
 
-FoundationDB occasionally publishes AVX-enabled patch releases. Those builds do not run on older CPUs such as Intel Xeon X5690.
+## FoundationDB Cluster Version
 
-The workflow fails closed:
+Use the FDB version encoded in the image tag for the FoundationDB servers as well. For example:
 
-- AVX-marked FoundationDB releases are skipped.
-- Ambiguous release-note sections fail the workflow.
-- The selected FDB version is included in every versioned image tag.
+```yaml
+image: foundationdb/foundationdb:7.4.4
+```
+
+FoundationDB `7.4.4` is a pre-release, but its official release notes explicitly state that it was compiled **without AVX instructions**. Newer AVX-enabled patches such as `7.4.5` and `7.4.6` are skipped automatically.
 
 ## Manual Run
 
@@ -37,19 +45,5 @@ Use GitHub Actions -> `Build Stalwart FDB Image` -> `Run workflow`.
 
 Optional inputs:
 
-- `stalwart_version`: exact upstream Stalwart tag, for example `v0.16.14`
-- `fdb_version`: exact FoundationDB version override, only accepted if release notes classify it as non-AVX
-
-## Compose Example
-
-```yaml
-services:
-  ms-stalwart:
-    image: ghcr.io/mk796/stalwart-fdb:latest
-```
-
-For reproducible deployments prefer a pinned tag:
-
-```yaml
-image: ghcr.io/mk796/stalwart-fdb:v0.16.14-fdb7.3.78
-```
+- `stalwart_version`: exact stable upstream tag containing the FDB binary
+- `fdb_version`: exact release from that Stalwart tag's required API series; accepted only when the official release notes explicitly classify it as non-AVX

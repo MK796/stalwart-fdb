@@ -1,0 +1,52 @@
+[
+  {
+    "tag_name": "7.4.6",
+    "draft": false,
+    "prerelease": true,
+    "body": "This release is compiled with AVX instructions.",
+    "assets": [
+      {"name": "libfdb_c.x86_64.so"},
+      {"name": "libfdb_c.x86_64.so.sha256"}
+    ]
+  },
+  {
+    "tag_name": "7.4.5",
+    "draft": false,
+    "prerelease": true,
+    "body": "This release is AVX-enabled.",
+    "assets": [
+      {"name": "libfdb_c.x86_64.so"},
+      {"name": "libfdb_c.x86_64.so.sha256"}
+    ]
+  },
+  {
+    "tag_name": "7.4.4",
+    "draft": false,
+    "prerelease": true,
+    "body": "This release is compiled without avx instructions.",
+    "assets": [
+      {"name": "libfdb_c.x86_64.so"},
+      {"name": "libfdb_c.x86_64.so.sha256"}
+    ]
+  },
+  {
+    "tag_name": "7.4.3",
+    "draft": false,
+    "prerelease": true,
+    "body": "This release is compiled with AVX instructions.",
+    "assets": [
+      {"name": "libfdb_c.x86_64.so"},
+      {"name": "libfdb_c.x86_64.so.sha256"}
+    ]
+  },
+  {
+    "tag_name": "7.4.2",
+    "draft": false,
+    "prerelease": true,
+    "body": "This is a non-AVX build.",
+    "assets": [
+      {"name": "libfdb_c.x86_64.so"},
+      {"name": "libfdb_c.x86_64.so.sha256"}
+    ]
+  }
+]
