@@ -14,7 +14,7 @@ jobs:
   scripts:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Syntax check
         run: |
@@ -32,5 +32,22 @@ jobs:
           set -Eeuo pipefail
           if python3 scripts/select-fdb-version.py --release-notes-file tests/fixtures/fdb-release-notes-730-mini.html --requested-version 7.3.79 --print-version; then
             echo "Expected AVX override to fail" >&2
+            exit 1
+          fi
+
+      - name: Dockerfile patch aligns Cargo build arguments
+        run: |
+          set -Eeuo pipefail
+          patched_dockerfile="$(mktemp)"
+          trap 'rm -f "${patched_dockerfile}"' EXIT
+          cp tests/fixtures/Dockerfile.fdb-upstream-mini "${patched_dockerfile}"
+
+          python3 scripts/pin-dockerfile-fdb-version.py "${patched_dockerfile}" 7.3.78
+
+          grep -Fqx 'ARG FDB_VERSION="7.3.78"' "${patched_dockerfile}"
+          grep -Fq 'select(.tag_name == $VERSION)' "${patched_dockerfile}"
+          grep -Fqx 'RUN cargo chef cook --release --recipe-path recipe.json -p stalwart --no-default-features --features "foundationdb s3 redis azure nats enterprise"' "${patched_dockerfile}"
+          if grep -Fq 'FDB_VERSION_RANGE' "${patched_dockerfile}"; then
+            echo "FDB_VERSION_RANGE still exists after patch" >&2
             exit 1
           fi
