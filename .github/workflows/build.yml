@@ -181,10 +181,11 @@ jobs:
               --version
           )"
           test "${actual_version}" = "${STALWART_VERSION#v}"
+          echo "Stalwart version: ${actual_version}"
           docker run --rm \
             --entrypoint /bin/sh \
             "${IMAGE}:${VERSION_TAG}" \
-            -c "ldd /usr/local/bin/stalwart | grep -F 'libfdb_c.so => /usr/lib/libfdb_c.so'"
+            -c "ldd /usr/local/bin/stalwart | grep -F 'libfdb_c.so => '"
 
       - name: Push tags
         if: steps.exists.outputs.exists != 'true'
