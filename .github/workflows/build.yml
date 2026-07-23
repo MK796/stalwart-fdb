@@ -236,6 +236,16 @@ jobs:
           shared-key: stalwart-fdb-p2p-${{ matrix.architecture }}
           cache-on-failure: true
 
+      - name: Provision swap for full release LTO
+        if: matrix.architecture == 'amd64'
+        run: |
+          set -Eeuo pipefail
+          sudo fallocate -l 12G /mnt/stalwart-build.swap
+          sudo chmod 0600 /mnt/stalwart-build.swap
+          sudo mkswap /mnt/stalwart-build.swap
+          sudo swapon /mnt/stalwart-build.swap
+          free -h
+
       - name: Download and verify FoundationDB development files
         shell: bash
         env:
