@@ -1,0 +1,10 @@
+[package]
+name = "stalwart"
+version = "0.16.14"
+
+[features]
+default = ["rocks", "enterprise"]
+foundationdb = ["store/foundation", "common/foundation"]
+s3 = ["store/s3"]
+zenoh = ["coordinator/zenoh"]
+enterprise = ["common/enterprise"]

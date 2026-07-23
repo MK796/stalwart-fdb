@@ -21,7 +21,7 @@ jobs:
           set -Eeuo pipefail
           python3 -m py_compile scripts/*.py
 
-      - name: Select newest stable Stalwart release with FDB asset
+      - name: Select newest stable Stalwart release
         run: |
           set -Eeuo pipefail
           selected="$(
@@ -29,10 +29,26 @@ jobs:
               --releases-file tests/fixtures/stalwart-releases-mini.json \
               --print-latest
           )"
-          test "${selected}" = "v0.16.14"
+          test "${selected}" = "v0.16.15"
           python3 scripts/list-stalwart-tags.py \
             --releases-file tests/fixtures/stalwart-releases-mini.json \
-            --validate v0.16.14
+            --validate v0.16.15
+
+      - name: Validate required Stalwart features
+        run: |
+          set -Eeuo pipefail
+          features="$(
+            python3 scripts/validate-stalwart-features.py \
+              tests/fixtures/stalwart-main-Cargo.toml
+          )"
+          test "${features}" = "foundationdb s3 zenoh enterprise"
+          sed '/^zenoh =/d' tests/fixtures/stalwart-main-Cargo.toml \
+            > /tmp/stalwart-main-without-zenoh.toml
+          if python3 scripts/validate-stalwart-features.py \
+            /tmp/stalwart-main-without-zenoh.toml; then
+            echo "Expected a manifest without zenoh to fail validation" >&2
+            exit 1
+          fi
 
       - name: Detect Stalwart FDB API series
         run: |

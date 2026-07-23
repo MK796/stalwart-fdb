@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Select stable Stalwart releases that publish the FoundationDB binary."""
+"""Select stable Stalwart releases."""
 
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ import urllib.request
 from pathlib import Path
 
 API_URL = "https://api.github.com/repos/stalwartlabs/stalwart/releases?per_page=100"
-REQUIRED_ASSET = "stalwart-foundationdb-x86_64-unknown-linux-gnu.tar.gz"
 TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
 
 
@@ -50,19 +49,11 @@ def stable_tags(data: object) -> list[str]:
         if version is None:
             continue
 
-        assets = release.get("assets")
-        asset_names = {
-            asset.get("name")
-            for asset in (assets if isinstance(assets, list) else [])
-            if isinstance(asset, dict)
-        }
-        if REQUIRED_ASSET not in asset_names:
-            continue
         releases.append((version, tag))
 
     releases.sort(reverse=True)
     if not releases:
-        raise RuntimeError("No stable Stalwart release with a FoundationDB binary found")
+        raise RuntimeError("No stable Stalwart release found")
     return [tag for _, tag in releases]
 
 
@@ -94,9 +85,7 @@ def main() -> int:
 
     if args.validate:
         if args.validate not in tags:
-            raise RuntimeError(
-                f"{args.validate} is not a stable Stalwart release with {REQUIRED_ASSET}"
-            )
+            raise RuntimeError(f"{args.validate} is not a stable Stalwart release")
         print(args.validate)
     elif args.json:
         print(json.dumps({"latest": tags[0], "tags": tags}, sort_keys=True))

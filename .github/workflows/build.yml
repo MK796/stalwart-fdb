@@ -1,10 +1,10 @@
-name: Build Stalwart FDB Image
+name: Build Stalwart FDB-P2P Image
 
 on:
   workflow_dispatch:
     inputs:
       stalwart_version:
-        description: "Exact stable upstream Stalwart tag. Empty selects the newest release with an FDB binary."
+        description: "Exact stable upstream Stalwart tag. Empty selects the newest stable release."
         required: false
         type: string
       fdb_version:
@@ -17,18 +17,34 @@ on:
 permissions:
   contents: read
   packages: write
-  attestations: read
+
+concurrency:
+  group: stalwart-fdb-p2p
+  cancel-in-progress: false
+
+env:
+  STALWART_FEATURES: foundationdb,s3,zenoh,enterprise
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      stalwart_version: ${{ steps.versions.outputs.stalwart_version }}
+      stalwart_major_minor: ${{ steps.versions.outputs.stalwart_major_minor }}
+      stalwart_commit: ${{ steps.versions.outputs.stalwart_commit }}
+      fdb_series: ${{ steps.versions.outputs.fdb_series }}
+      fdb_version: ${{ steps.versions.outputs.fdb_version }}
+      image: ${{ steps.versions.outputs.image }}
+      version_tag: ${{ steps.versions.outputs.version_tag }}
+      publish_latest: ${{ steps.versions.outputs.publish_latest }}
+      skip: ${{ steps.existing.outputs.skip }}
 
     steps:
       - name: Checkout automation
         uses: actions/checkout@v6
 
-      - name: Select compatible versions
+      - name: Select and validate versions
+        id: versions
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -45,9 +61,17 @@ jobs:
             stalwart_version="${latest_stalwart}"
           fi
 
+          stalwart_commit="$(
+            gh api "repos/stalwartlabs/stalwart/commits/${stalwart_version}" --jq .sha
+          )"
+          gh api -H 'Accept: application/vnd.github.raw+json' \
+            "repos/stalwartlabs/stalwart/contents/crates/main/Cargo.toml?ref=${stalwart_commit}" \
+            > /tmp/stalwart-main-Cargo.toml
+          python3 scripts/validate-stalwart-features.py /tmp/stalwart-main-Cargo.toml
+
           fdb_series="$(
             gh api -H 'Accept: application/vnd.github.raw+json' \
-              "repos/stalwartlabs/stalwart/contents/crates/store/Cargo.toml?ref=${stalwart_version}" \
+              "repos/stalwartlabs/stalwart/contents/crates/store/Cargo.toml?ref=${stalwart_commit}" \
               | python3 scripts/detect-fdb-series.py
           )"
           recommended_fdb="$(
@@ -66,30 +90,262 @@ jobs:
             fdb_version="${recommended_fdb}"
           fi
 
+          assets="$(
+            gh release view "${fdb_version}" \
+              --repo apple/foundationdb \
+              --json assets
+          )"
+          required_assets=(
+            "fdb-headers-${fdb_version}.tar.gz"
+            "fdb-headers-${fdb_version}.tar.gz.sha256"
+            "libfdb_c.x86_64.so"
+            "libfdb_c.x86_64.so.sha256"
+            "libfdb_c.aarch64.so"
+            "libfdb_c.aarch64.so.sha256"
+          )
+          for asset in "${required_assets[@]}"; do
+            jq -e --arg asset "${asset}" \
+              '.assets | any(.name == $asset)' <<<"${assets}" >/dev/null
+          done
+
           stalwart_major_minor="$(python3 scripts/list-stalwart-tags.py --print-major-minor "${stalwart_version}")"
           image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/stalwart-fdb"
-          version_tag="${stalwart_version}-fdb${fdb_version}"
+          version_tag="${stalwart_version}-fdb${fdb_version}-p2p"
           publish_latest=false
           if [ "${stalwart_version}" = "${latest_stalwart}" ] && [ "${fdb_version}" = "${recommended_fdb}" ]; then
             publish_latest=true
           fi
 
           {
-            echo "STALWART_VERSION=${stalwart_version}"
-            echo "STALWART_MAJOR_MINOR=${stalwart_major_minor}"
-            echo "STALWART_ASSET=stalwart-foundationdb-x86_64-unknown-linux-gnu.tar.gz"
-            echo "FDB_SERIES=${fdb_series}"
-            echo "FDB_VERSION=${fdb_version}"
-            echo "FDB_LIBRARY=libfdb_c.x86_64.so"
-            echo "IMAGE=${image}"
-            echo "VERSION_TAG=${version_tag}"
-            echo "PUBLISH_LATEST=${publish_latest}"
-          } >> "${GITHUB_ENV}"
+            echo "stalwart_version=${stalwart_version}"
+            echo "stalwart_major_minor=${stalwart_major_minor}"
+            echo "stalwart_commit=${stalwart_commit}"
+            echo "fdb_series=${fdb_series}"
+            echo "fdb_version=${fdb_version}"
+            echo "image=${image}"
+            echo "version_tag=${version_tag}"
+            echo "publish_latest=${publish_latest}"
+          } >> "${GITHUB_OUTPUT}"
 
-          echo "Stalwart: ${stalwart_version}"
+          echo "Stalwart: ${stalwart_version} (${stalwart_commit})"
+          echo "Features: ${STALWART_FEATURES}"
           echo "FoundationDB API: ${fdb_series}"
-          echo "FoundationDB client/server: ${fdb_version} (non-AVX)"
+          echo "FoundationDB client/server: ${fdb_version}"
           echo "Image: ${image}:${version_tag}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Verify matching FoundationDB server image exists
+        run: docker manifest inspect "foundationdb/foundationdb:${{ steps.versions.outputs.fdb_version }}" >/dev/null
+
+      - name: Check for complete immutable multi-platform image
+        id: existing
+        shell: bash
+        env:
+          IMAGE: ${{ steps.versions.outputs.image }}
+          VERSION_TAG: ${{ steps.versions.outputs.version_tag }}
+        run: |
+          set -Eeuo pipefail
+          skip=false
+          if raw_manifest="$(docker buildx imagetools inspect "${IMAGE}:${VERSION_TAG}" --raw 2>/dev/null)"; then
+            platforms="$(
+              jq -r '.manifests[]?.platform | "\(.os)/\(.architecture)"' \
+                <<<"${raw_manifest}" | sort -u
+            )"
+            expected="$(printf '%s\n' linux/amd64 linux/arm64)"
+            if [ "${platforms}" = "${expected}" ]; then
+              skip=true
+              echo "${IMAGE}:${VERSION_TAG} already contains linux/amd64 and linux/arm64."
+            fi
+          fi
+          echo "skip=${skip}" >> "${GITHUB_OUTPUT}"
+
+      - name: Preparation summary
+        run: |
+          {
+            echo "## Stalwart FDB-P2P"
+            echo
+            echo "- Stalwart: ${{ steps.versions.outputs.stalwart_version }}"
+            echo "- Upstream commit: \`${{ steps.versions.outputs.stalwart_commit }}\`"
+            echo "- Features: \`${STALWART_FEATURES}\`"
+            echo "- FoundationDB API series: ${{ steps.versions.outputs.fdb_series }}"
+            echo "- FoundationDB client/server: ${{ steps.versions.outputs.fdb_version }}"
+            echo "- Image: \`${{ steps.versions.outputs.image }}:${{ steps.versions.outputs.version_tag }}\`"
+            echo "- Complete image already exists: ${{ steps.existing.outputs.skip }}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+            fdb_library: libfdb_c.x86_64.so
+          - architecture: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            fdb_library: libfdb_c.aarch64.so
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout automation
+        uses: actions/checkout@v6
+
+      - name: Checkout exact upstream Stalwart commit
+        uses: actions/checkout@v6
+        with:
+          repository: stalwartlabs/stalwart
+          ref: ${{ needs.prepare.outputs.stalwart_commit }}
+          path: upstream
+          fetch-depth: 1
+
+      - name: Verify upstream source
+        run: |
+          set -Eeuo pipefail
+          test "$(git -C upstream rev-parse HEAD)" = "${{ needs.prepare.outputs.stalwart_commit }}"
+          python3 scripts/validate-stalwart-features.py upstream/crates/main/Cargo.toml
+
+      - name: Install native build dependencies
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -yq --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            clang \
+            cmake \
+            jq \
+            pkg-config \
+            protobuf-compiler
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Restore architecture-specific Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: upstream -> target
+          shared-key: stalwart-fdb-p2p-${{ matrix.architecture }}
+          cache-on-failure: true
+
+      - name: Download and verify FoundationDB development files
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FDB_VERSION: ${{ needs.prepare.outputs.fdb_version }}
+          FDB_LIBRARY: ${{ matrix.fdb_library }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p downloads dist
+          header_archive="fdb-headers-${FDB_VERSION}.tar.gz"
+
+          gh release download "${FDB_VERSION}" \
+            --repo apple/foundationdb \
+            --pattern "${header_archive}" \
+            --pattern "${header_archive}.sha256" \
+            --pattern "${FDB_LIBRARY}" \
+            --pattern "${FDB_LIBRARY}.sha256" \
+            --dir downloads
+
+          (
+            cd downloads
+            sha256sum -c "${header_archive}.sha256"
+            sha256sum -c "${FDB_LIBRARY}.sha256"
+          )
+
+          sudo mkdir -p /usr/include/foundationdb
+          sudo tar -xzf "downloads/${header_archive}" -C /usr/include/foundationdb
+          sudo install -m 0644 "downloads/${FDB_LIBRARY}" /usr/lib/libfdb_c.so
+          sudo ldconfig
+          install -m 0644 "downloads/${FDB_LIBRARY}" dist/libfdb_c.so
+
+      - name: Build Stalwart from the unchanged upstream source
+        env:
+          RUSTFLAGS: -C target-cpu=generic -L native=/usr/lib
+          LD_LIBRARY_PATH: /usr/lib
+        run: scripts/build-stalwart.sh upstream
+
+      - name: Stage runtime binary
+        run: |
+          set -Eeuo pipefail
+          install -m 0755 upstream/target/release/stalwart dist/stalwart
+          actual_version="$(LD_LIBRARY_PATH="${PWD}/dist" ./dist/stalwart --version)"
+          expected_version="${{ needs.prepare.outputs.stalwart_version }}"
+          test "${actual_version}" = "${expected_version#v}"
+
+      - name: Upload Cargo timings
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: cargo-timings-${{ matrix.architecture }}
+          path: upstream/target/cargo-timings/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Build local smoke-test image
+        shell: bash
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          VERSION_TAG: ${{ needs.prepare.outputs.version_tag }}
+        run: |
+          set -Eeuo pipefail
+          docker build \
+            --build-arg "STALWART_VERSION=${{ needs.prepare.outputs.stalwart_version }}" \
+            --build-arg "STALWART_COMMIT=${{ needs.prepare.outputs.stalwart_commit }}" \
+            --build-arg "STALWART_FEATURES=${STALWART_FEATURES}" \
+            --build-arg "FDB_VERSION=${{ needs.prepare.outputs.fdb_version }}" \
+            --build-arg "TARGETARCH=${{ matrix.architecture }}" \
+            --tag "${IMAGE}:${VERSION_TAG}-${{ matrix.architecture }}-smoke" \
+            .
+
+      - name: Smoke test local image
+        shell: bash
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          VERSION_TAG: ${{ needs.prepare.outputs.version_tag }}
+        run: |
+          set -Eeuo pipefail
+          image="${IMAGE}:${VERSION_TAG}-${{ matrix.architecture }}-smoke"
+
+          actual_version="$(
+            docker run --rm --entrypoint /usr/local/bin/stalwart "${image}" --version
+          )"
+          expected_version="${{ needs.prepare.outputs.stalwart_version }}"
+          test "${actual_version}" = "${expected_version#v}"
+          docker run --rm --entrypoint /bin/sh "${image}" \
+            -c "ldd /usr/local/bin/stalwart | grep -F 'libfdb_c.so => '"
+          test "$(docker run --rm --entrypoint /usr/bin/id "${image}" -u)" = "2000"
+          test "$(
+            docker inspect --format '{{ index .Config.Labels "org.mk796.stalwart.features" }}' "${image}"
+          )" = "${STALWART_FEATURES}"
+
+          container="$(
+            docker run -d -p 127.0.0.1::8080 "${image}"
+          )"
+          trap 'docker logs "${container}" || true; docker rm -f "${container}" >/dev/null 2>&1 || true' EXIT
+          port="$(
+            docker inspect --format '{{ (index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort }}' "${container}"
+          )"
+
+          healthy=false
+          for _ in $(seq 1 60); do
+            if curl -fsS "http://127.0.0.1:${port}/healthz/live" >/dev/null; then
+              healthy=true
+              break
+            fi
+            sleep 2
+          done
+          test "${healthy}" = "true"
+          docker rm -f "${container}" >/dev/null
+          trap - EXIT
 
       - name: Login to GHCR
         uses: docker/login-action@v4
@@ -98,124 +354,123 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Verify matching FoundationDB server image exists
-        shell: bash
-        run: docker manifest inspect "foundationdb/foundationdb:${FDB_VERSION}" >/dev/null
-
-      - name: Check whether immutable image tag exists
-        id: exists
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          if docker manifest inspect "${IMAGE}:${VERSION_TAG}" >/dev/null 2>&1; then
-            echo "exists=true" >> "${GITHUB_OUTPUT}"
-            echo "${IMAGE}:${VERSION_TAG} already exists; skipping build."
-          else
-            echo "exists=false" >> "${GITHUB_OUTPUT}"
-          fi
-
-      - name: Download and verify upstream artifacts
-        if: steps.exists.outputs.exists != 'true'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -Eeuo pipefail
-          mkdir -p dist downloads
-
-          gh release download "${STALWART_VERSION}" \
-            --repo stalwartlabs/stalwart \
-            --pattern "${STALWART_ASSET}" \
-            --dir downloads
-          gh attestation verify "downloads/${STALWART_ASSET}" \
-            --repo stalwartlabs/stalwart
-
-          tar --no-same-owner -xzf "downloads/${STALWART_ASSET}" -C dist
-          mv dist/stalwart-foundationdb dist/stalwart
-          chmod 0755 dist/stalwart
-
-          gh release download "${FDB_VERSION}" \
-            --repo apple/foundationdb \
-            --pattern "${FDB_LIBRARY}*" \
-            --dir downloads
-          (
-            cd downloads
-            sha256sum -c "${FDB_LIBRARY}.sha256"
-          )
-          install -m 0644 "downloads/${FDB_LIBRARY}" dist/libfdb_c.so
-
-          readelf -d dist/stalwart | grep -F 'Shared library: [libfdb_c.so]'
-          actual_version="$(LD_LIBRARY_PATH="${PWD}/dist" ./dist/stalwart --version)"
-          test "${actual_version}" = "${STALWART_VERSION#v}"
-
       - name: Set up Docker Buildx
-        if: steps.exists.outputs.exists != 'true'
         uses: docker/setup-buildx-action@v4
 
-      - name: Build runtime image
-        if: steps.exists.outputs.exists != 'true'
+      - name: Push platform image by digest
+        id: push
         uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64
-          load: true
-          pull: true
-          tags: ${{ env.IMAGE }}:${{ env.VERSION_TAG }}
+          platforms: ${{ matrix.platform }}
+          push: true
+          outputs: type=image,name=${{ needs.prepare.outputs.image }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
-            STALWART_VERSION=${{ env.STALWART_VERSION }}
-            FDB_VERSION=${{ env.FDB_VERSION }}
+            STALWART_VERSION=${{ needs.prepare.outputs.stalwart_version }}
+            STALWART_COMMIT=${{ needs.prepare.outputs.stalwart_commit }}
+            STALWART_FEATURES=${{ env.STALWART_FEATURES }}
+            FDB_VERSION=${{ needs.prepare.outputs.fdb_version }}
+            TARGETARCH=${{ matrix.architecture }}
           labels: |
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.stalwart_commit }}
             org.opencontainers.image.url=https://github.com/${{ github.repository }}
 
-      - name: Smoke test image
-        if: steps.exists.outputs.exists != 'true'
+      - name: Export platform digest
         shell: bash
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
         run: |
           set -Eeuo pipefail
-          actual_version="$(
-            docker run --rm \
-              --entrypoint /usr/local/bin/stalwart \
-              "${IMAGE}:${VERSION_TAG}" \
-              --version
-          )"
-          test "${actual_version}" = "${STALWART_VERSION#v}"
-          echo "Stalwart version: ${actual_version}"
-          docker run --rm \
-            --entrypoint /bin/sh \
-            "${IMAGE}:${VERSION_TAG}" \
-            -c "ldd /usr/local/bin/stalwart | grep -F 'libfdb_c.so => '"
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
 
-      - name: Push tags
-        if: steps.exists.outputs.exists != 'true'
+      - name: Upload platform digest
+        uses: actions/upload-artifact@v6
+        with:
+          name: digests-${{ matrix.architecture }}
+          path: digests/
+          if-no-files-found: error
+          retention-days: 1
+
+  manifest:
+    needs:
+      - prepare
+      - build
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download platform digests
+        uses: actions/download-artifact@v7
+        with:
+          pattern: digests-*
+          path: digests
+          merge-multiple: true
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Publish multi-platform tags
         shell: bash
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          VERSION_TAG: ${{ needs.prepare.outputs.version_tag }}
+          PUBLISH_LATEST: ${{ needs.prepare.outputs.publish_latest }}
+          STALWART_MAJOR_MINOR: ${{ needs.prepare.outputs.stalwart_major_minor }}
+          FDB_VERSION: ${{ needs.prepare.outputs.fdb_version }}
         run: |
           set -Eeuo pipefail
-          docker push "${IMAGE}:${VERSION_TAG}"
+          mapfile -t digests < <(find digests -maxdepth 1 -type f -printf '%f\n' | sort)
+          test "${#digests[@]}" -eq 2
 
+          sources=()
+          for digest in "${digests[@]}"; do
+            sources+=("${IMAGE}@sha256:${digest}")
+          done
+
+          tags=(--tag "${IMAGE}:${VERSION_TAG}")
           if [ "${PUBLISH_LATEST}" = "true" ]; then
-            aliases=(
-              "${STALWART_MAJOR_MINOR}-fdb${FDB_VERSION}"
-              "latest-fdb${FDB_VERSION}"
-              "latest"
+            tags+=(
+              --tag "${IMAGE}:${STALWART_MAJOR_MINOR}-fdb${FDB_VERSION}-p2p"
+              --tag "${IMAGE}:latest-fdb${FDB_VERSION}-p2p"
+              --tag "${IMAGE}:latest"
             )
-            for tag in "${aliases[@]}"; do
-              docker tag "${IMAGE}:${VERSION_TAG}" "${IMAGE}:${tag}"
-              docker push "${IMAGE}:${tag}"
-            done
           fi
 
-      - name: Summary
+          docker buildx imagetools create "${tags[@]}" "${sources[@]}"
+
+      - name: Verify published platforms
         shell: bash
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          VERSION_TAG: ${{ needs.prepare.outputs.version_tag }}
+        run: |
+          set -Eeuo pipefail
+          raw_manifest="$(docker buildx imagetools inspect "${IMAGE}:${VERSION_TAG}" --raw)"
+          platforms="$(
+            jq -r '.manifests[]?.platform | "\(.os)/\(.architecture)"' \
+              <<<"${raw_manifest}" | sort -u
+          )"
+          expected="$(printf '%s\n' linux/amd64 linux/arm64)"
+          test "${platforms}" = "${expected}"
+          printf '%s\n' "${platforms}"
+
+      - name: Publication summary
         run: |
           {
-            echo "## stalwart-fdb"
+            echo "## Published Stalwart FDB-P2P image"
             echo
-            echo "- Official Stalwart binary: ${STALWART_VERSION}"
-            echo "- FoundationDB API series: ${FDB_SERIES}"
-            echo "- Non-AVX FDB client/server: ${FDB_VERSION}"
-            echo "- Image: ${IMAGE}:${VERSION_TAG}"
-            echo "- Matching cluster image: foundationdb/foundationdb:${FDB_VERSION}"
-            echo "- Existing immutable tag skipped: ${{ steps.exists.outputs.exists }}"
+            echo "- Image: \`${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.version_tag }}\`"
+            echo "- Platforms: \`linux/amd64\`, \`linux/arm64\`"
+            echo "- Stalwart commit: \`${{ needs.prepare.outputs.stalwart_commit }}\`"
+            echo "- Features: \`${STALWART_FEATURES}\`"
+            echo "- FoundationDB: ${{ needs.prepare.outputs.fdb_version }}"
           } >> "${GITHUB_STEP_SUMMARY}"
