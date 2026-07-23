@@ -150,7 +150,7 @@ jobs:
           skip=false
           if raw_manifest="$(docker buildx imagetools inspect "${IMAGE}:${VERSION_TAG}" --raw 2>/dev/null)"; then
             platforms="$(
-              jq -r '.manifests[]?.platform | "\(.os)/\(.architecture)"' \
+              jq -r '.manifests[]?.platform | select(.os == "linux") | "\(.os)/\(.architecture)"' \
                 <<<"${raw_manifest}" | sort -u
             )"
             expected="$(printf '%s\n' linux/amd64 linux/arm64)"
@@ -466,7 +466,7 @@ jobs:
           set -Eeuo pipefail
           raw_manifest="$(docker buildx imagetools inspect "${IMAGE}:${VERSION_TAG}" --raw)"
           platforms="$(
-            jq -r '.manifests[]?.platform | "\(.os)/\(.architecture)"' \
+            jq -r '.manifests[]?.platform | select(.os == "linux") | "\(.os)/\(.architecture)"' \
               <<<"${raw_manifest}" | sort -u
           )"
           expected="$(printf '%s\n' linux/amd64 linux/arm64)"
